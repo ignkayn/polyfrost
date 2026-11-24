@@ -41,6 +41,7 @@ import org.polyfrost.oneconfig.api.hud.v1.HudAnchor
 import org.polyfrost.oneconfig.api.ui.v1.ExperimentalOneConfigUiApi
 import org.polyfrost.oneconfig.api.hud.v1.HudManager
 import org.polyfrost.oneconfig.api.platform.v1.Platform
+import java.text.Bidi
 import java.util.IdentityHashMap
 import java.util.function.Supplier
 import kotlin.math.abs
@@ -118,7 +119,9 @@ private val EXAMPLE: Lyrics = parseLrc(
 
 private val NO_WIDTHS = FloatArray(0)
 
-private class Placed(val startMs: Long, val endMs: Long, val text: String, val trimmed: String, val x: Float, val ink: Float) {
+private class Placed(val startMs: Long, val endMs: Long, val text: String, val trimmed: String, val x: Float, val ink: Float, val level: Int = 0, val mixed: Boolean = false) {
+    val rtl: Boolean get() = level and 1 == 1
+
     private var letterTexts: Array<String>? = null
 
     var letterWidths: FloatArray = NO_WIDTHS
@@ -150,6 +153,7 @@ private data class GlyphMark(
     val sung: Int,
     val progress: Float,
     val glow: Float,
+    val rtl: Boolean = false,
 )
 
 
@@ -564,9 +568,9 @@ class LyricsHud : Hud(
                     val glow = if (glowing) wordGlow(settle) * emphasis else 0f
                     val cx = place(rowOffset + word.x + word.ink / 2f)
                     val trimmed = word.trimmed
-                    val held = motion && progress > 0f && progress < 1f && word.endMs - word.startMs >= LETTER_MIN_MS && trimmed.length in 2..LETTER_MAX
+                    val held = motion && !word.mixed && progress > 0f && progress < 1f && word.endMs - word.startMs >= LETTER_MIN_MS && trimmed.length in 2..LETTER_MAX
                     if (!held) {
-                        marks.add(GlyphMark(trimmed, cx, baseline - lift, word.ink, scale, base, sung, progress, glow))
+                        marks.add(GlyphMark(trimmed, cx, baseline - lift, word.ink, scale, base, sung, progress, glow, word.rtl))
                         continue
                     }
                     val letters = word.letters(label)
@@ -579,9 +583,9 @@ class LyricsHud : Hud(
                         val letterWidth = letterWidths[k]
                         val falloff = envelope / (1f + abs(k + 0.5f - active).pow(2.8f))
                         val letterScale = scale * (1f + LETTER_SCALE * falloff)
-                        val letterCx = cx + (x + letterWidth / 2f - word.ink / 2f) * scale
+                        val letterCx = cx + (if (word.rtl) word.ink / 2f - x - letterWidth / 2f else x + letterWidth / 2f - word.ink / 2f) * scale
                         val letterGlow = if (glowing) maxOf(glow, falloff) else 0f
-                        marks.add(GlyphMark(letter, letterCx, baseline - lift - LETTER_LIFT * falloff, letterWidth, letterScale, base, sung, (active - k).coerceIn(0f, 1f), letterGlow))
+                        marks.add(GlyphMark(letter, letterCx, baseline - lift - LETTER_LIFT * falloff, letterWidth, letterScale, base, sung, (active - k).coerceIn(0f, 1f), letterGlow, word.rtl))
                         x += letterWidth
                     }
                 }
@@ -647,8 +651,10 @@ class LyricsHud : Hud(
         val rows = ArrayList<List<Placed>>()
         var row = ArrayList<Placed>()
         var x = 0f
-        for (word in line.words) {
-            val text = applyCase(word.text)
+        val texts = line.words.map { applyCase(it.text) }
+        val levels = wordLevels(texts)
+        for ((i, word) in line.words.withIndex()) {
+            val text = texts[i]
             val trimmed = text.trimEnd()
             val ink = label.width(trimmed)
             if (wrapText && row.isNotEmpty() && x + ink > maxWidth) {
@@ -656,11 +662,20 @@ class LyricsHud : Hud(
                 row = ArrayList()
                 x = 0f
             }
-            row.add(Placed(word.startMs, word.endMs, text, trimmed, x, ink))
+            val level = levels?.get(i) ?: 0
+            row.add(Placed(word.startMs, word.endMs, text, trimmed, x, ink, level, levels != null && mixedDirection(trimmed, level and 1 == 1)))
             x += label.width(text)
         }
         if (row.isNotEmpty()) rows.add(row)
-        LineLayout(rows)
+        LineLayout(if (levels == null) rows else rows.map { visualRow(it, label) })
+    }
+
+    private fun visualRow(row: List<Placed>, label: Label): List<Placed> {
+        val words = visualWords(IntArray(row.size) { row[it].level }, FloatArray(row.size) { row[it].ink }, FloatArray(row.size) { label.width(row[it].text) - row[it].ink })
+        return words.map { (i, _, x) ->
+            val p = row[i]
+            Placed(p.startMs, p.endMs, p.text, p.trimmed, x, p.ink, p.level, p.mixed)
+        }
     }
 
     private fun contentWidth(lyrics: Lyrics, label: Label): Float {
@@ -844,8 +859,8 @@ private fun RenderContext.drawGlyph(mark: GlyphMark, label: Label, plain: Label)
     }
     val edge = -FEATHER + (mark.width + FEATHER) * mark.progress
     fun slice(from: Float, to: Float, color: Int) {
-        val left = from.coerceAtLeast(0f)
-        val right = to.coerceAtMost(mark.width + 1f)
+        val left = (if (mark.rtl) mark.width - to else from).coerceAtLeast(if (mark.rtl) -1f else 0f)
+        val right = (if (mark.rtl) mark.width - from else to).coerceAtMost(mark.width + 1f)
         if (right <= left || !color.visible) return
         save()
         clipRect(x + left, -ROW_HEIGHT * 2f, right - left, ROW_HEIGHT * 3f)
@@ -856,6 +871,42 @@ private fun RenderContext.drawGlyph(mark: GlyphMark, label: Label, plain: Label)
     val step = FEATHER / FEATHER_STEPS
     for (k in 0 until FEATHER_STEPS) slice(edge + k * step, edge + (k + 1) * step, mark.sung.withAlphaScale(1f - (k + 0.5f) / FEATHER_STEPS))
 }
+
+internal data class VisualWord(val index: Int, val rtl: Boolean, val x: Float)
+
+internal fun wordLevels(words: List<String>): IntArray? {
+    val line = words.joinToString("")
+    if (line.all { it < '\u0590' } || !Bidi.requiresBidi(line.toCharArray(), 0, line.length)) return null
+    val bidi = Bidi(line, Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT)
+    var at = 0
+    return IntArray(words.size) { i ->
+        val word = words[i]
+        bidi.getLevelAt(at + word.indexOfFirst { it.isLetterOrDigit() }.coerceAtLeast(0)).also { at += word.length }
+    }
+}
+
+internal fun visualWords(wordLevels: IntArray, ink: FloatArray, gap: FloatArray): List<VisualWord> {
+    val levels = ByteArray(wordLevels.size * 2 - 1) { k ->
+        (if (k % 2 == 0) wordLevels[k / 2] else minOf(wordLevels[k / 2], wordLevels[k / 2 + 1])).toByte()
+    }
+    val order = Array<Any>(levels.size) { it }
+    Bidi.reorderVisually(levels, 0, order, 0, order.size)
+    var x = 0f
+    val placed = ArrayList<VisualWord>(wordLevels.size)
+    for (item in order) {
+        val k = item as Int
+        val i = k / 2
+        if (k % 2 == 1) {
+            x += gap[i]
+            continue
+        }
+        placed.add(VisualWord(i, wordLevels[i] and 1 == 1, x))
+        x += ink[i]
+    }
+    return placed
+}
+
+internal fun mixedDirection(word: String, rtl: Boolean): Boolean = visualOrder(word) != if (rtl) word.reversed() else word
 
 private fun spring(ms: Float): Float {
     if (ms <= 0f) return 0f
